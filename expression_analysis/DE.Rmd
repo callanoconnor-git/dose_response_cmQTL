@@ -1,0 +1,618 @@
+---
+title: "Differential Gene Expression"
+author: "DMG"
+date: "3/23/2023"
+output: 
+    html_document:
+        toc: true
+        toc_depth: 2
+        toc_float: true
+---
+
+
+```{r setup}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+#install.packages('BiocManager', repos = 'https://cloud.r-project.org')
+#BiocManager::install(pkgs = c('DESeq2', 'pheatmap'), update = FALSE)
+
+library(ggplot2)
+library(tidyverse)
+library(DESeq2)
+library(unglue)
+library(ggthemes)
+```
+
+
+```{r read_counts_file, echo = FALSE,message=FALSE}
+library("plyr")
+library(tidyverse)
+library(unglue)
+setwd("~/Desktop/rnaseq_meta/results/")
+
+read_plus <- function(flnm) {
+    read_tsv(flnm) %>% 
+        mutate(filename = flnm)
+}
+
+
+#tbl <-
+#    list.files(path = "~/Desktop/rnaseq_meta/results",
+#               pattern = "*.diploid.genes.expected_read_counts",
+#              full.names = T,
+#              recursive = T) %>%
+#     map_df(~read_plus(.)) 
+#tbl2<- tbl %>% dplyr::mutate(individual = unglue_vec(filename,"/{}/{}/{}/{}/{}/{}/{x}_{}_{}"),
+#                                            conc = unglue_vec(filename,"/{}/{}/{}/{}/{}/{}/{}_{x}_{}"))
+#write.csv(tbl2,"~/Desktop/rnaseq_meta/tbl2.csv")
+tbl2<- read_csv("~/Desktop/rnaseq_meta/tbl2.csv")
+```
+
+
+## Prepare Data for DESeq2
+```{r merge_data}
+#countdata<- read_csv("~/Desktop/rnaseq_meta/countmat.csv")
+```
+### Create DESeqDataSet
+
+```{r }
+metadata = read.csv('~/Desktop/rnaseq_meta/rnaseq_meta_readin2.csv', stringsAsFactors = TRUE)
+countdata<- tbl2 %>% dplyr::rename(gene_id = "#target_id")
+#write.csv(countmat , "~/Desktop/rnaseq_meta/countmat.csv")
+geneids<- read_tsv("~/Desktop/rnaseq_meta/HGNC_AllianceHomology.rpt.txt")
+
+
+
+countdata<- left_join(countdata,geneids, by = c("gene_id"= "Ensembl Gene ID"))
+metadata <- metadata %>% dplyr::select(-individual) %>% dplyr::rename(conc = "dose",
+                                                            individual ="sample.to.plate.fri_sat")%>%dplyr::mutate(arsenic = ifelse(conc > 0, "Yes", "No"))
+countdata  <- countdata %>% dplyr::mutate(arsenic = ifelse(conc > 0, "Yes", "No"))
+metadata$individual<- as.character(metadata$individual)
+countdata$individual<- as.character(countdata$individual)
+
+countmetadata <- left_join(countdata,metadata, by = c("individual","arsenic"))
+
+metadata$anno<- as.factor(metadata$anno)
+metadata$conc<- as.factor(metadata$conc)
+metadata <- metadata %>% dplyr::rename(sex = "SEX")
+
+countmetadata$total<- as.numeric(countmetadata$total)
+countmat<- countmetadata %>% dplyr::select(gene_id,individual,total,conc.y) %>%
+  pivot_wider(
+    names_from = c(individual,conc.y),
+    values_from = total,
+    values_fn = mean
+  )  %>% column_to_rownames("gene_id") %>%
+  as.matrix
+#write.csv(countmat,"~/Desktop/rnaseq_meta/countmat.csv")
+
+rdyformat<- metadata[,c(-6)] %>% dplyr::select(individual,sex,do_generation,anno,do_generation,conc,A,B,C,D,E,"F",G,H) %>% mutate(sample = paste(individual,conc, sep = "_"))
+rdyformat<- rdyformat[order(match(rdyformat[,6],colnames(countmat))),]
+rownames(rdyformat)<- NULL
+
+# #meta2<- meta2 %>% janitor::clean_names()
+# rdyformat<- left_join(rdyformat,meta2[,c(1,5)],by = c( "individual" = "sample_to_plate_fri_sat"))
+
+
+metafullmatrix<- cbind(model.matrix(~sex+conc, data=rdyformat),
+      rdyformat %>% mutate(allele = ifelse(anno == "NOD", "0",
+                    ifelse(anno == "NOD/NZO", "1",
+                    ifelse(anno == "NZO", "2","wrong"))))) %>% dplyr::rename(arsenic= "conc0.75")
+
+
+rownames(metafullmatrix)<- NULL
+metafullmatrix$sexM<- as.factor(metafullmatrix$sexM)
+metafullmatrix$allele<- as.factor(metafullmatrix$allele)
+metafullmatrix$do_generation<- as.factor(metafullmatrix$do_generation)
+metafullmatrix$arsenic<- as.factor(metafullmatrix$arsenic)
+metafullmatrix$genoprobs <- "NO"
+metafullmatrix$genoprobs[metafullmatrix$D > .9 ] <- "hom"
+metafullmatrix$genoprobs[metafullmatrix$D > .6] <- "most"
+metafullmatrix$genoprobs[metafullmatrix$E > .9 ] <- "hom"
+metafullmatrix$genoprobs[metafullmatrix$E > .6] <- "most"
+metafullmatrix$genoprobs[metafullmatrix$D < .6 &metafullmatrix$D  > .4 ] <- "het"
+metafullmatrix$genoprobs[metafullmatrix$E < .6 &metafullmatrix$E  > .4 ] <- "het"
+
+
+metamat<- metafullmatrix %>% dplyr::select(sample,sexM,arsenic,allele,do_generation,genoprobs) %>% 
+  column_to_rownames("sample") %>%
+  as.matrix()
+metamat<- metamat[order(match(rownames(metamat),colnames(countmat))),]
+
+#write.csv(metamat,"~/Desktop/rnaseq_meta/metamat.csv")
+#write.csv(metafullmatrix,"~/Desktop/rnaseq_meta/metafullmatrix.csv")
+
+
+countmat = round(countmat)
+
+
+```
+
+
+One way to think about this data is as a set of three related tables. We have:
+
+1. Gene expression data with *genes* in rows and *samples* in columns,
+2. Sample metadata,
+3. Gene metadata.
+
+We can organize the data as shown in the figure below.
+
+![Summarized Experiment](./summarized_experiment.png)
+
+##Filter based on TPM cutfoffs of 1/2 0 or median TPM < .5
+```{r}
+tpmcutoff<- readRDS("~/Documents/arsenic_project/data/tpm_cutoff.rds")
+countmat<- countmat %>% as.data.frame() %>% dplyr::mutate(gene = rownames(.)) %>% filter(!gene %in% tpmcutoff$gene) %>% dplyr::select(-gene) %>% as.matrix()
+
+```
+
+#DE
+```{r create_dds}
+dds = DESeq2::DESeqDataSetFromMatrix(countData = countmat,
+                             colData   = metamat,
+                              design    =  ~ allele + sexM + arsenic + allele:arsenic + sexM:arsenic)
+
+                            # design    = ~ anno + conc + sex + anno:conc)
+#+ diet:cd45level)
+```
+
+#DE Names
+
+```{r filter_genes}
+dds <- estimateSizeFactors(dds)
+dim(dds)
+
+dds = DESeq(dds)
+#saveRDS(dds,"~/Documents/arsenic_project/data/dds_rnaseq.rds")
+dds<- readRDS("~/Documents/arsenic_project/data/dds_rnaseq.rds")
+
+```
+
+
+```{r view_results_names}
+resultsNames(dds)
+colData(dds)
+#summary(results(dds, name= "anno_NZO_vs_NOD"))
+#saveRDS(dds,"~/Desktop/rnaseq_meta/de_dds.rds")
+```
+#Pull Group Specific Data
+
+```{r }
+dose_results<- results(dds, list("arsenic_1_vs_0"))
+
+allele_results<- results(dds, list("allele_2_vs_0"))
+
+sex_results<- results(dds, list("sexM_1_vs_0"))
+```
+
+#EXAMPLE) TXNRD1
+```{r write_results}
+plotCounts(dds, gene="ENSMUSG00000020250", intgroup=c("arsenic","allele"))
+
+```
+
+### Selectinferentially Expressed Genes by adjP and logFC
+
+
+```{r}
+#https://biocorecrg.github.io/CRG_RIntroduction/volcano-plots.html
+
+allgenes<- read_delim("~/Downloads/MGI_Gene_Model_Coord.rpt.txt")
+res_plot<- as.data.frame(dose_results) %>% dplyr::mutate(gene= rownames(dose_results))
+allgenes<- allgenes[,c(3,11)]
+colnames(allgenes)<- c("symbol","gene")
+#saveRDS(dose_results,"~/Documents/arsenic_project/data/dose_results.rds")
+
+de<- left_join(res_plot,allgenes, by = c("gene.id" = "gene"))
+
+de$diffexpressed <- "NO"
+de$diffexpressed[de$log2FoldChange > .75 & de$padj < 0.05] <- "UP"
+de$diffexpressed[de$log2FoldChange < -.25 & de$padj < 0.05] <- "DOWN"
+#de$diffexpressed[de$gene.id == "ENSMUSG00000020250"] <- "TXNRD1"
+de$delabel <- NA
+de$delabel[de$diffexpressed != "NO"] <- de$symbol[de$diffexpressed != "NO"]
+
+
+scatter_theme <- theme(#panel.grid.major = element_line(color = "gray70", size = 0.1), 
+                      # panel.grid.minor = element_blank(),
+  legend.position = "none",
+                       panel.background = element_blank(),
+                       axis.line = element_line(colour = "black"),
+                       plot.title = element_text(hjust = 0.5), 
+                       axis.text = element_text(size = 16),
+                       axis.title = element_text(size = 16),
+                      axis.text.y=element_text(face = "bold"),
+                      axis.text.x=element_text(face = "bold"))
+```
+
+
+```{r}
+
+library(ggrepel)
+# plot adding up all layers we have seen so far
+
+ ggplot(data=(de %>% arrange(diffexpressed,padj)), aes(x=log2FoldChange, y=-log10(padj), 
+                     col=diffexpressed, 
+                     label=delabel
+                     )) +
+        geom_point(alpha = .4,size = 2,shape = 19, stroke=NA) + 
+        theme_minimal() +
+       geom_text_repel(max.overlaps = Inf,segment.size = .1) +
+        scale_color_manual(values=c("#0072B2", "gray", "#D55E00")) +
+        geom_vline(xintercept=c(-1, 1), col="black",lty = 2) +
+        geom_hline(yintercept=-log10(0.05), col="black",lty = 2)+scatter_theme+xlim(-15,NA)+labs(y=expression(-log[10]~"adjusted P"),x=expression(log[2]~"FC"))
+
+# ggsave(
+#     filename = "~/Documents/arsenic_project/figures/DE_all.pdf",
+#     width = 9, height = 8, dpi = 300, units = "in", device='pdf',useDingbats = F
+# )
+# 
+# 
+
+#Cutoff
+ggplot(data=(de %>% arrange(diffexpressed,padj)), aes(x=log2FoldChange, y=-log10(padj), 
+                     col=diffexpressed, 
+                     label=delabel
+                     )) +
+        geom_point(alpha = .4,size = 2,shape = 19, stroke=NA) + 
+        theme_minimal() +
+       geom_text_repel(max.overlaps = 20,segment.size = .1,min.segment.length = 0.2, nudge_x = .15) +
+        scale_color_manual(values=c("#19A07F", "gray", "#C16436")) +
+        geom_vline(xintercept=c(-1, 1), col="black",lty = 2) +
+        geom_hline(yintercept=-log10(0.05), col="black",lty = 2)+scatter_theme+xlim(-2.5,10)+ylim(NA,10)+labs(y=expression(-log[10]~"adjusted P"),x=expression(log[2]~"FC"))
+# ggsave(
+#     filename = "~/Documents/arsenic_project/figures/DE_zoom.pdf",
+#     width = 7, height = 7, dpi = 300, units = "in", device='pdf',useDingbats = F
+# )
+# 
+
+
+ggplot(data=(de %>% arrange(diffexpressed,padj) %>% filter(gene %in% geneset$ensembl_id)), aes(x=log2FoldChange, y=-log10(padj), 
+                     col=diffexpressed, 
+                     label=delabel
+                     )) +
+        geom_point(alpha = .4,size = 2,shape = 19, stroke=NA) + 
+        theme_minimal() +
+       geom_text_repel(max.overlaps = 30,segment.size = .1) +
+        scale_color_manual(values=c("#0072B2", "gray", "#D55E00")) +
+        geom_vline(xintercept=c(-1, 1), col="black",lty = 2) +
+        geom_hline(yintercept=-log10(0.05), col="black",lty = 2)+scatter_theme+xlim(-5,10)+labs(y=expression(-log[10]~"adjusted P"),x=expression(log[2]~"FC"))
+
+
+# ggsave(
+#     filename = "~/Documents/arsenic_project/figures/DE_inqtl.pdf",
+#     width =9, height = 8, dpi = 300, units = "in", device='pdf',useDingbats = F
+# )
+
+
+```
+
+#Variance Stabilization
+
+```{r vst}
+vds = vst(dds)
+counts_vst = assay(vds)
+```
+
+### Pathway Analysis
+
+```{r}
+#library(devtools)
+#install_github("ctlab/fgsea")
+
+library(data.table)
+library(fgsea)
+library(ggplot2)
+library(msigdbr)
+
+source("~/Documents/arsenic_project/scripts/gsea_functions.R")
+```
+#Set Up fgsea
+
+```{r fgsea run}
+## Grab all gene sets
+all_gene_sets <- msigdbr(species = "Mus musculus")
+
+## Map gene.id to gene sets
+gene_to_set <- all_gene_sets %>% 
+  filter(gs_subcat %in% c("GO:BP","GO:CC","GO:MF","CP:KEGG","CP:REACTOME","CP:BIOCARTA",   "CP:WIKIPATHWAYS")) %>%
+  mutate(gs_name = factor(gs_name)) %>%
+  dplyr::select(gs_name, ensembl_gene) %>%
+  dplyr::rename(gene.id = ensembl_gene)
+
+## Making lists of genes per category
+go_pathways <- split(x = gene_to_set$gene.id, f = gene_to_set$gs_name)
+```
+
+#Run Arsenic GSEA - Score Based
+
+```{r, echo = FALSE}
+## Run fgsea for each tissue
+dose_fgsea_tables <- sex_fgsea_tables <- list()
+
+
+  
+
+dose_results<- as.data.frame(dose_results) %>% dplyr::mutate(gene.id = rownames(.))
+dose_fgsea <- run_fgsea(effects_dat = dose_results %>%
+                           dplyr::select(log2FoldChange, lfcSE, stat,gene.id
+                                         #,padj
+                                         ) %>%
+                           dplyr::rename(effect = "log2FoldChange",
+                                         effect_se = "lfcSE",
+                                         stats = "stat"),
+                         go_pathways = go_pathways,
+                         eps = 0)  
+ dose_scores<-  dose_results$log2FoldChange/dose_results$lfcSE
+  names(dose_scores) <- dose_results$gene.id
+  dse_scores <- dose_scores[-which(duplicated(names(dose_scores)))]
+  # if (jitter_ammount > 0) {
+  #   dosescores <- jitter(scores, amount = jitter_ammount)
+  # }
+  dose_scores <- sort(dose_scores, decreasing = TRUE)
+  
+  dose_gene_list <- dose_fgsea$collapsed_enrichment$leadingEdge
+  names(dose_gene_list) <-  dose_fgsea$collapsed_enrichment$pathway
+  
+  dose_gene_level_dat <- plyr::ldply(dose_gene_list, rbind) %>% 
+    dplyr::rename(pathway = .id) %>% 
+    gather(key = "test", value = "gene.id", -pathway) %>% 
+    dplyr::select(-test) %>% 
+    filter(!is.na(gene.id)) %>% 
+    left_join(all_gene_sets %>% 
+                dplyr::select(ensembl_gene, gene_symbol) %>%
+                dplyr::rename(gene.id = ensembl_gene,
+                              symbol = gene_symbol)) %>% 
+    unique
+  
+  # Collapse to set level data
+  dose_pathway_id_dat <- dose_gene_level_dat %>%
+    dplyr::select(pathway, gene.id) %>%
+    group_by(pathway) %>%
+    summarize(gene.ids = paste(gene.id, collapse = "|"))
+  dose_pathway_symbol_dat <- dose_gene_level_dat %>%
+    dplyr::select(pathway, symbol) %>%
+    group_by(pathway) %>%
+    summarize(symbols = paste(symbol, collapse = "|"))
+  
+  dose_table <- dose_fgsea$collapsed_enrichment %>% 
+    as.data.frame() 
+#saveRDS(dose_fgsea$enrichment,"~/Documents/arsenic_project/data/gsea_dose_scores.rds")
+#saveRDS(dose_table,"~/Documents/arsenic_project/data/dose_table.rds")
+#saveRDS(sex_table,"~/Desktop/rnaseq_meta/sex_table.rds")
+
+```
+
+```{r}
+topPathwaysUp <- dose_fgsea$collapsed_enrichment[ES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- dose_fgsea$collapsed_enrichment[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+
+plotGseaTable(go_pathways[topPathways], dose_fgsea$collapsed_enrichment, dose_fgsea, 
+gseaParam=0.5)  
+  
+topPathways <- dose_fgsea$collapsed_enrichment %>% 
+    top_n(20, wt=-padj) %>% 
+    arrange(-NES) %>% 
+    pull(pathway)
+
+topPathways <- dose_fgsea$collapsed_enrichment %>% 
+   # top_n(20, wt=-padj) %>% 
+    arrange(-NES) #%>% 
+   # pull(pathway)
+
+
+
+plotGseaTable(go_pathways[topPathways],
+              dose_scores,
+              dose_fgsea$enrichment,
+              pathwayLabelStyle=list(size=5.6),
+              headerLabelStyle = list(color="black"),
+              axisLabelStyle = list(size=6),
+              valueStyle = list(size=10),
+              gseaParam = 0.5)
+
+
+```
+
+# Setup Allele Specific GSEA
+
+```{r,echo = FALSE}
+dds$group <- factor(paste0(dds$allele, dds$arsenic))
+design(dds) <- ~ group
+dds <- DESeq(dds)
+resultsNames(dds)
+allele_2<- results(dds, contrast=c("group", "01", "21"))
+
+allele_plot2<- as.data.frame(allele_2) %>% dplyr::mutate(gene= rownames(.))
+allele_de<- left_join(allele_plot2,allgenes, by = c("gene"))
+
+
+```
+
+
+
+#Run Allele GSEA Score-Based
+
+```{r}
+#saveRDS(allele_2,"~/Documents/arsenic_project/data/allele_2.rds")
+allele_results<- as.data.frame(allele_2) %>% dplyr::mutate(gene.id = rownames(.))
+allele_fgsea <- run_fgsea(effects_dat = allele_results %>%
+                           dplyr::select(log2FoldChange, lfcSE, stat,gene.id
+                                         #,padj
+                                         ) %>%
+                           dplyr::rename(effect = "log2FoldChange",
+                                         effect_se = "lfcSE",
+                                         stats = "stat"),
+                         go_pathways = go_pathways,
+                         eps = 0)
+  
+  # Grab gene symbols
+  allele_gene_list <- allele_fgsea$collapsed_enrichment$leadingEdge
+  names(allele_gene_list) <-  allele_fgsea$collapsed_enrichment$pathway
+  
+  allele_gene_level_dat <- plyr::ldply(allele_gene_list, rbind) %>% 
+    dplyr::rename(pathway = .id) %>% 
+    gather(key = "test", value = "gene.id", -pathway) %>% 
+    dplyr::select(-test) %>% 
+    filter(!is.na(gene.id)) %>% 
+    left_join(all_gene_sets %>% 
+                dplyr::select(ensembl_gene, gene_symbol) %>%
+                dplyr::rename(gene.id = ensembl_gene,
+                              symbol = gene_symbol)) %>% 
+    unique
+  
+  # Collapse to set level data
+  allele_pathway_id_dat <- allele_gene_level_dat %>%
+    dplyr::select(pathway, gene.id) %>%
+    group_by(pathway) %>%
+    summarize(gene.ids = paste(gene.id, collapse = "|"))
+  allele_pathway_symbol_dat <- allele_gene_level_dat %>%
+    dplyr::select(pathway, symbol) %>%
+    group_by(pathway) %>%
+    summarize(symbols = paste(symbol, collapse = "|"))
+  
+#saveRDS(allele_fgsea,"~/Documents/arsenic_project/allele_fgsea.rds")
+allele_table <- allele_fgsea$collapsed_enrichment %>% 
+    as.data.frame() #%>% 
+    # left_join(sex_pathway_id_dat) %>%
+    # left_join(sex_pathway_symbol_dat) %>%
+    # arrange(desc(abs(NES))) %>%
+    # dplyr::select(pathway, log2err, ES, NES, size, pval, padj, gene.ids, symbols)
+  
+  # sex_fgsea_tables[[i]] <- sex_table
+#  names(sex_fgsea_tables)[i] <- tissues[i]
+  
+  ## Age
+  
+  #saveRDS(allele_table,"~/Documents/arsenic_project/data/gsea_allele_table.rds")
+  
+  
+```
+
+#Volcano plot for Arsenic GSEA
+
+```{r}
+gsea_theme <- theme(
+  #legend.position = "none",
+  axis.text.y=element_text(size=rel(0.4),face = "bold"),
+                       panel.background = element_blank(),
+                       axis.line = element_line(colour = "black"),
+                       plot.title = element_text(hjust = 0.5), 
+                       axis.text = element_text(size = 16),
+                       axis.title = element_text(size = 16))
+
+tps<- dose_fgsea$enrichment %>% dplyr::mutate(geneset = unglue::unglue_vec(pathway,"{x}_{}")) %>% dplyr::mutate(path = gsub( "_"," ", unglue::unglue_vec(pathway,"{}_{x}") ))
+# tps$path[tps$path =='NAD METABOLISM IN ONCOGENEINDUCED SENESCENCE AND MITOCHONDRIAL DYSFUNCTIONASSOCIATED SENESCENCE']<- "...MITOCHONDRIAL DYSFUNCTION ASSOCIATED SENESCENCE"
+
+
+#tps$colors<- c(rep("firebrick3",30),rep("dodgerblue3",30))
+#https://stackoverflow.com/questions/57153428/r-plot-color-combinations-that-are-colorblind-accessible
+#https://stackoverflow.com/questions/60301305/chose-colors-for-scale-colour-colorblind-in-ggthemes
+library(ggthemes)
+COLS=colorblind_pal()(8)
+COLS = COLS[c(3,5,7,6,1,8)]
+
+colorset = c( 'GOBP' = "#0000FF", 'GOCC' = "#4949FF",'GOMF' ="#A3A3FF" ,'KEGG' ="#F0E442" ,'REACTOME' = "#CC79A7",'WP' = "#D55E00")
+
+
+gsea_theme1 <- theme(
+    panel.grid.major = element_line(color = "gray70", size = 0.1), 
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    plot.title = element_text(hjust = 0.5), 
+    #axis.text = element_text(size = 8),
+    legend.key = element_rect(colour = "transparent", fill = "white"),
+    axis.title = element_text(size = 16),
+    axis.title.y = element_blank(),
+    axis.text.y=element_text(face = "bold",size = 6),
+    axis.text.x=element_text(face = "bold",size = 12),
+    strip.background = element_blank(),
+    strip.text = element_text(color = "black",face = "bold",size = "14"))
+gsea_theme2 <- theme(
+    panel.grid.major = element_line(color = "gray70", size = 0.1), 
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    plot.title = element_text(hjust = 0.5), 
+    #axis.text = element_text(size = 8),
+    legend.key = element_rect(colour = "transparent", fill = "white"),
+    axis.title = element_text(size = 16),
+    #axis.title.y = element_blank(),
+    axis.text.y=element_text(face = "bold",size = 14),
+    axis.text.x=element_text(face = "bold",size = 14),
+    strip.background = element_blank(),
+    strip.text = element_text(color = "black",face = "bold",size = "14"))
+
+
+ggplot(tps %>% filter(NES > 2), aes(x=NES, y=reorder(as.factor(path),NES), color = as.factor(geneset))) + geom_point(aes(size = size),alpha = .7,shape = 19, stroke=NA)+xlim(c(0,4.8))+scale_color_manual( values = c(colorset) )+gsea_theme1+labs(color = "Source")+ scale_size_binned(breaks = c(100, 200, 300, 400))
+# ggsave(
+#     filename = "~/Documents/arsenic_project/figures/gsea_up.pdf",
+#     width = 7, height = 7
+# )
+# 
+
+ggplot(tps %>% filter(NES < -2), aes(x=NES, y=reorder(as.factor(path),-NES), color = as.factor(geneset))) + geom_point(aes(size = size),alpha = .7,shape = 19, stroke=NA)+geom_errorbar(aes(xmin=NES-log2err, xmax=NES+log2err,alpha = .7,color = as.factor(geneset)), width=.2,position=position_dodge(.9),alpha = .7)+xlim(c(-5,0))+scale_color_manual( values = c(colorset) )+gsea_theme+labs(color = "Source")+ scale_size_binned(breaks = c(100, 200, 300, 400))
+# ggsave(
+#     filename = "~/Documents/arsenic_project/figures/gsea_down.pdf",
+#     width = 7, height = 7, dpi = 300, units = "in", device='pdf',useDingbats = F
+# )
+
+
+pathlabels<-  c("CHROMOSOME CENTROMERIC REGION","GLYCOPROTEIN METABOLIC PROCESS","NRF2 PATHWAY","GLUTATHIONE CONJUGATION","ENDOPLASMIC RETICULUM LUMEN","DETOXIFICATION","ANTIOXIDANT_ACTIVITY","NUCLEAR RECEPTORS METAPATHWAY","OXIDATIVE_STRESS_RESPONSE","RIBONUCLEOPROTEIN COMPLEX BIOGENESIS",
+"EXTRACELLULAR MATRIX ORGANIZATION",
+"CELLULAR RESPONSE TO CHEMICAL STRESS",
+"BIOLOGICAL OXIDATIONS",
+"MITOCHONDRION ORGANIZATION")
+set.seed(54)
+ggplot(tps, aes(x=NES, y=-log10(padj),
+                label = ifelse(path %in% pathlabels, path, "")
+                ), color= (padj)) + geom_point(aes(size = size,color = padj),alpha = .9,shape = 19, stroke=NA)+gsea_theme2+labs(color = "adj P")+ scale_size_binned(breaks = c(100, 200, 300, 400))+ geom_vline(xintercept=c(0,0), col="darkgray",lty = 2,lwd = 1) +geom_hline(yintercept=-log10(0.05), col="darkgray",lty = 2,lwd = 1)+labs(y=expression(-log[10]~"adjusted P"))+ 
+    scale_color_gradientn(trans='log10',colors = c("#00008B","#3457d5","#4868d9","#7189e2", "#aebcee","#d6ddf7", "gray"))+      geom_text_repel(min.segment.length = 0, seed = 42, box.padding = 0.5,max.overlaps = Inf,hjust = 1,nudge_y = .2,size = 2.3,segment.size = .2)
+
+# ggsave(
+#     filename = "~/Documents/arsenic_project/figures/gsea_volcano.pdf",
+#     width = 7, height = 7, dpi = 300, units = "in", device='pdf',useDingbats = F
+# )
+
+
+
+```
+
+#Volcano plot for Allele GSEA
+
+```{r}
+
+aps<- allele_fgsea$enrichment %>% dplyr::mutate(geneset = unglue::unglue_vec(pathway,"{x}_{}")) %>% dplyr::mutate(path = gsub( "_"," ", unglue::unglue_vec(pathway,"{}_{x}") ))
+
+pathlabels2<-  c("ENDOPLASMIC RETICULUM LUMEN","RIBONUCLEOPROTEIN COMPLEX BIOGENESIS",
+"DNA REPAIR",
+"NCRNA METABOLIC PROCESS",
+"CATALYTIC ACTIVITY ACTING ON RNA",
+"ORGANELLE FISSION",
+"LYSOSOME",
+"ENDOPLASMIC RETICULUM LUMEN",
+"SUPEROXIDE METABOLIC PROCESS",
+"DNA REPLICATION",
+"REGULATION OF RESPONSE TO OXIDATIVE STRESS"
+)
+set.seed(54)
+ggplot(aps, aes(x=NES, y=-log10(padj),
+                label = ifelse(path %in% pathlabels2, path, "")
+), color= (padj)) + geom_point(aes(size = size,color = padj),alpha = .9,shape = 19, stroke=NA)+gsea_theme2+labs(color = "adj P")+ scale_size_binned(breaks = c(100, 200, 300, 400))+ geom_vline(xintercept=c(0,0), col="darkgray",lty = 2,lwd = 1) +geom_hline(yintercept=-log10(0.05), col="darkgray",lty = 2,lwd = 1)+labs(y=expression(-log[10]~"adjusted P"))+ 
+    scale_color_gradientn(trans='log10',colors = c("#00008B","#3457d5","#4868d9","#7189e2", "#aebcee","#d6ddf7", "gray"))+      geom_text_repel(min.segment.length = 0.2, seed = 42, box.padding = 0.5,max.overlaps = Inf,hjust = 1,nudge_y = .2,size = 2.3,segment.size = .2)
+
+
+
+# ggsave(
+#     filename = "~/Documents/arsenic_project/figures/gsea_volcano_allele.pdf",
+#     width = 7, height = 7, dpi = 300, units = "in", device='pdf',useDingbats = F
+# )
+
+
+```
+
+
+
+
